@@ -1,22 +1,23 @@
 // ==UserScript==
 // @name         雨课堂刷课助手
 // @namespace    http://tampermonkey.net/
-// @version      3.0.6
-// @description  针对雨课堂视频进行自动播放，配置AI自动答题
+// @version      3.0.7-local.1
+// @description  雨课堂播放与课程导航修复版：完成状态校验、失败停止、API 安全改进
 // @author       风之子
 // @license      GPL3
 // @match        *://*.yuketang.cn/*
 // @match        *://*.gdufemooc.cn/*
 // @run-at       document-start
-// @icon         http://yuketang.cn/favicon.ico
+// @icon         https://yuketang.cn/favicon.ico
 // @grant        unsafeWindow
 // @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
 // @connect      api.openai.com
 // @connect      api.moonshot.cn
 // @connect      api.deepseek.com
 // @connect      dashscope.aliyuncs.com
 // @connect      api.anthropic.com
-// @connect      *
 // @connect      cdn.jsdelivr.net
 // @connect      unpkg.com
 // @require      https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js
@@ -30,7 +31,7 @@
 
   // ---- 脚本配置，用户可修改 ----
   const Config = {
-    version: '3.0.6',     // 版本号
+    version: '3.0.7-local.1',     // 版本号
     playbackRate: 2,      // 视频播放倍速
     pptInterval: 3000,    // ppt翻页间隔
     storageKeys: {        // 使用者勿动
@@ -131,20 +132,26 @@
       });
     },
     async getDDL() {
+      // 元数据若迟迟不加载，不能让等待 Promise 永远挂住。
       const element = document.querySelector('video') || document.querySelector('audio');
-
       const fallback = 180_000;
       if (!element) return fallback;
-
       let duration = Number(element.duration);
       if (!Number.isFinite(duration) || duration <= 0) {
-        await new Promise(resolve => element.addEventListener('loadedmetadata', resolve, { once: true }));
+        await new Promise(resolve => {
+          const finish = () => {
+            clearTimeout(timer);
+            element.removeEventListener('loadedmetadata', finish);
+            resolve();
+          };
+          const timer = setTimeout(finish, 5000);
+          element.addEventListener('loadedmetadata', finish, { once: true });
+        });
         duration = Number(element.duration);
       }
-
-      const elementDurationMs = duration * 1000;               // 转为秒
-      const timeout = Math.max(elementDurationMs * 3, 10_000); // 至少 10 秒（防极短视频）;
-      return timeout;
+      return Number.isFinite(duration) && duration > 0
+        ? Math.max(duration * 3000, 10_000)
+        : fallback;
     },
     // 关闭雨课堂的挂机/离开检测弹窗，避免遮罩拦截刷课流程
     dismissPopups() {
@@ -194,18 +201,23 @@
     getAIConf() {
       const raw = localStorage.getItem(Config.storageKeys.ai);
       const saved = Utils.safeJSONParse(raw, {}) || {};
-      const conf = {
+      // 清除旧版 localStorage 中可能残留的明文 API Key；不自动使用旧密钥。
+      if (Object.prototype.hasOwnProperty.call(saved, 'key')) {
+        delete saved.key;
+        localStorage.setItem(Config.storageKeys.ai, JSON.stringify(saved));
+      }
+      return {
         url: saved.url ?? "https://api.deepseek.com/chat/completions",
-        key: saved.key ?? "sk-xxxxxxx",
+        key: GM_getValue('ykt_ai_api_key', ''),
         model: saved.model ?? "deepseek-chat",
-        apiFormat: saved.apiFormat ?? "openai", // openai 或 anthropic
-        authMethod: saved.authMethod ?? "bearer", // bearer 或 x-api-key
+        apiFormat: saved.apiFormat ?? "openai",
+        authMethod: saved.authMethod ?? "bearer",
       };
-      localStorage.setItem(Config.storageKeys.ai, JSON.stringify(conf));
-      return conf;
     },
     setAIConf(conf) {
-      localStorage.setItem(Config.storageKeys.ai, JSON.stringify(conf));
+      GM_setValue('ykt_ai_api_key', conf.key || '');
+      const { key, ...nonSecret } = conf;
+      localStorage.setItem(Config.storageKeys.ai, JSON.stringify(nonSecret));
     },
     getProClassCount() {
       const value = localStorage.getItem(Config.storageKeys.proClassCount);
@@ -951,6 +963,24 @@
     getActiveLeafTitle() {
       return document.querySelector('.leaf-item.is-active')?.innerText?.replace(/\s+/g, ' ').trim() || '';
     },
+    isCurrentTaskCompleted() {
+      // 只能读取“当前任务”的完成标记，不能拿课程目录其他节点的完成状态。
+      const active = document.querySelector('.leaf-item.is-active');
+      const activeRow = active?.closest('.nav-item-leaf-box') || null;
+      if (activeRow && /已完成|完成度\s*100%/.test(this.normalizeText(activeRow.innerText))) {
+        return true;
+      }
+      // 在播放器页面的“已完成”独立状态标签中读取，排除目录里其他课程的标签。
+      const exactStatuses = [...document.querySelectorAll('span, label, strong, em, b, div')]
+        .filter(el => el.children.length === 0 && this.normalizeText(el.textContent) === '已完成');
+      return exactStatuses.some(el => {
+        const row = el.closest('.nav-item-leaf-box');
+        if (row) return row === activeRow;
+        // 导航栏/列表里的完成标记不代表当前播放内容完成。
+        if (el.closest('nav, aside, [class*="sidebar"], [class*="course-list"], [class*="catalog"]')) return false;
+        return this.isVisibleElement(el);
+      });
+    },
     getExerciseDocument() {
       const localHasExercise = document.querySelector('#app .container-body .container-problem')
         || document.querySelector('#app .container-problem')
@@ -1061,6 +1091,8 @@
   // ---- 防切屏 ----
   function preventScreenCheck() {
     const win = unsafeWindow;
+    if (win.__yktFocusPatched) return;
+    Object.defineProperty(win, '__yktFocusPatched', { value: true, configurable: true });
     const blackList = new Set(['visibilitychange', 'blur', 'pagehide']);
     win._addEventListener = win.addEventListener;
     win.addEventListener = (...args) => blackList.has(args[0]) ? undefined : win._addEventListener(...args);
@@ -1158,8 +1190,6 @@ ${ocrText}
           };
           // 调试日志
           console.log('[AI请求] URL:', API_URL);
-          console.log('[AI请求] Headers:', headers);
-          console.log('[AI请求] Body:', requestBody);
           panel.log(`请求 ${API_URL}...`);
           GM_xmlhttpRequest({
             method: 'POST',
@@ -1177,8 +1207,7 @@ ${ocrText}
             timeout: 120000, // 120秒，思考模型需要更长响应时间
             onload: res => {
               console.log('[AI响应] Status:', res.status);
-              console.log('[AI响应] Response:', res.responseText);
-              if (res.status === 200) {
+                  if (res.status === 200) {
                 try {
                   const json = JSON.parse(res.responseText);
                   // Anthropic 返回格式: content[0].text
@@ -1961,23 +1990,47 @@ ${ocrText}
       const route = AiWorkspace.getRoute();
       if (!pending || !route) return '';
       if (pending.classroomId !== route.classroomId) return '';
-      console.log(`returnUrl:${pending.returnUrl}`)
       return pending.returnUrl || '';
     }
 
-    async autoSelect() {
-      // 进入ai - workspace的方式有两种：可以处理两种不同的逻辑，增加兼容性
-      const returnUrl = this.getReturnUrl()
-      // 1. 从传统的 v2 - pro / lms 的目录新开标签页进入（开始刷课）的
+    async autoSelect(previousRoute) {
+      const returnUrl = this.getReturnUrl();
       if (returnUrl) {
-        await this.returnToSource(returnUrl)
-      } else {
-        // 2. 直接从ai - workspac页面进入（开始刷课）的
-        this.panel.log("检测到是从ai - workspac页面点击开始刷课");
-        this.source = AiWorkspace.getAllScourse(); // 得到课程列表
-        this.activateIndex = Array.from(this.source).findIndex(el => el.firstChild.classList.contains("is-active")) // 现在正在刷第几个（从0开始）
-        await this.handleNext(this.activateIndex + 1)
+        const handedOff = await this.returnToSource(returnUrl);
+        return handedOff ? 'handoff' : false;
       }
+      const source = Array.from(AiWorkspace.getAllScourse() || []);
+      const activeIndex = source.findIndex(el => el.querySelector('.is-active'));
+      if (activeIndex < 0) {
+        this.panel.warn('未找到当前选中知识点，停止以防跳错');
+        return false;
+      }
+      const next = source[activeIndex + 1];
+      if (!next) {
+        this.panel.log('当前已是目录最后一项');
+        return false;
+      }
+      const clickable = next.firstElementChild;
+      if (!clickable) {
+        this.panel.warn('下一个知识点没有可点击元素');
+        return false;
+      }
+      clickable.click();
+      const changed = await Utils.poll(() => {
+        const newRoute = AiWorkspace.getRoute();
+        const newSource = Array.from(AiWorkspace.getAllScourse() || []);
+        const selectedIndex = newSource.findIndex(el => el.querySelector('.is-active'));
+        const previousKey = `${previousRoute.type}/${previousRoute.leafId}/${previousRoute.nodeId || ''}`;
+        const nextKey = newRoute && `${newRoute.type}/${newRoute.leafId}/${newRoute.nodeId || ''}`;
+        return Boolean(newRoute && nextKey !== previousKey && selectedIndex === activeIndex + 1);
+      }, { interval: 300, timeout: 10000 });
+      if (!changed) {
+        this.panel.warn('下一知识点的路由或目录选中状态未确认切换成功，已停止');
+        return false;
+      }
+      // 确保 SPA 新节点的播放器和状态完成渲染，避免读取到上一节的“已完成”。
+      await Utils.sleep(1200);
+      return true;
     }
 
     // 获取父窗口对象 window.opener
@@ -1995,7 +2048,6 @@ ${ocrText}
       this.panel.log('媒体播放完成，返回课程目录页继续匹配');
       await Utils.sleep(1200);
       const sourceWindow = this.getSourceWindow();
-      console.log(sourceWindow);
       if (sourceWindow) {
         try {
           sourceWindow.location.href = returnUrl;
@@ -2016,17 +2068,24 @@ ${ocrText}
 
     async handleMedia(route) {
       const title = AiWorkspace.getActiveLeafTitle() || `${route.type} ${route.leafId}`;
+      // 已经完成的任务不会再产生播放进度；先识别完成状态再尝试播放。
+      if (AiWorkspace.isCurrentTaskCompleted()) {
+        this.panel.log(`✅ ${title} 页面已标记完成，不重复播放`);
+        return true;
+      }
       this.panel.log(`开始播放：${title}`);
       const ready = await Utils.poll(() => Boolean(AiWorkspace.getMedia()), { interval: 500, timeout: 20000 });
       let media = AiWorkspace.getMedia();
       if (!ready || !media) {
-        this.panel.log('未找到视频/音频元素，停止当前轮次');
+        // 媒体可能已被销毁，但此时必须有明确完成标记，才允许继续。
+        if (AiWorkspace.isCurrentTaskCompleted()) return true;
+        this.panel.warn('未找到视频/音频元素，停止当前轮次');
         return false;
       }
 
       const playbackState = { completed: false };
       const shouldResume = () => !playbackState.completed;
-      let stopObserve = () => { };
+      let stopObserve = () => {};
       if (media.tagName.toLowerCase() === 'video') {
         Player.applySpeed();
         Player.mute();
@@ -2035,56 +2094,55 @@ ${ocrText}
         Player.applyMediaDefault(media);
       }
       const stopKeepAlive = AiWorkspace.keepAlive(shouldResume);
-      this.panel.log(`已接管播放器：${media.tagName.toLowerCase()}，目标倍速 ${Config.playbackRate}x，静音开启`);
+      this.panel.log(`已接管播放器：${media.tagName.toLowerCase()}，目标倍速 ${Config.playbackRate}x`);
       try {
-        let startTime = Number(media.currentTime || 0);
-        const started = await Utils.poll(() => {
+        const startTime = Number(media.currentTime || 0);
+        // 已经在终点的任务不可能再前进 0.5 秒；不能因此误判成播放失败。
+        const startedOrDone = await Utils.poll(() => {
+          if (AiWorkspace.isCurrentTaskCompleted()) return true;
           const currentMedia = AiWorkspace.getMedia();
           if (currentMedia) media = currentMedia;
           if (!media) return false;
           const currentTime = Number(media.currentTime || 0);
-          return currentTime > startTime + 0.5 || (!media.paused && media.readyState >= 2 && currentTime > startTime + 0.2);
+          return currentTime > startTime + 0.5
+            || (!media.paused && media.readyState >= 2 && currentTime > startTime + 0.2);
         }, { interval: 500, timeout: 15000 });
-        if (!started) {
-          this.panel.log('未确认到视频实际开始播放，停止当前轮次');
+        if (!startedOrDone) {
+          this.panel.warn('未确认播放且未找到当前任务完成标记：暂停自动切换');
           return false;
         }
-        startTime = Number(media.currentTime || 0);
 
-        let resolveEnded;
-        const endedPromise = new Promise(resolve => {
-          resolveEnded = resolve;
-        });
-        const onEnded = () => {
-          playbackState.completed = true;
-          resolveEnded(true);
-        };
-        media.addEventListener('ended', onEnded);
-        const done = await Promise.race([
-          endedPromise,
-          Utils.poll(() => {
-            if (playbackState.completed) return true;
+        if (!AiWorkspace.isCurrentTaskCompleted()) {
+          const observedStartTime = Number(media.currentTime || 0);
+          const done = await Utils.poll(() => {
+            if (AiWorkspace.isCurrentTaskCompleted()) return true;
             const currentMedia = AiWorkspace.getMedia();
             if (currentMedia) media = currentMedia;
-            if (AiWorkspace.isPlayerDone(media, { startTime, minPlayedDelta: 3 })) {
-              playbackState.completed = true;
-              return true;
-            }
+            // 视频本地播放完成不等于平台已确认任务完成。
+            return Boolean(media && (media.ended || AiWorkspace.isPlayerDone(media, {
+              startTime: observedStartTime,
+              minPlayedDelta: 0
+            })));
+          }, { interval: 1000, timeout: await Utils.getDDL() });
+          if (!done) {
+            this.panel.warn('等待视频结束超时：停止自动切换');
             return false;
-          }, { interval: 1000, timeout: await Utils.getDDL() })
-        ]);
-        media.removeEventListener('ended', onEnded);
-        playbackState.completed = true;
-        if (!done) {
-          this.panel.log('等待播放完成超时，停止当前轮次');
-          return false;
+          }
+          // 平台进度可能稍晚于本地 ended 事件，等待页面状态回写。
+          const verified = await Utils.poll(() => AiWorkspace.isCurrentTaskCompleted(), {
+            interval: 500, timeout: 12000
+          });
+          if (!verified) {
+            this.panel.warn('视频到了末尾，但尚未看到当前任务“已完成”标记，停止以防漏课');
+            return false;
+          }
         }
       } finally {
+        playbackState.completed = true;
         stopObserve();
         stopKeepAlive();
       }
-
-      this.panel.log(`${title} 播放完成`);
+      this.panel.log(`✅ ${title} 已确认完成`);
       return true;
     }
 
@@ -2154,8 +2212,8 @@ ${ocrText}
     async handleExercise(route) {
       const featureFlags = Store.getFeatureConf();
       if (!featureFlags.autoAI) {
-        this.panel.log('已关闭 AI 自动答题，作业将直接跳过');
-        return true;
+        this.panel.warn('当前为练习题且 AI 自动答题未启用，暂停以免漏掉任务');
+        return false;
       }
 
       const ready = await Utils.poll(() => Boolean(AiWorkspace.getExerciseContainer()), { interval: 500, timeout: 20000 });
@@ -2176,7 +2234,8 @@ ${ocrText}
           if (!currentTab) break;
           currentTab.click();
           await Utils.sleep(1200);
-          await this.solveExerciseQuestion(AiWorkspace.getExerciseContainer() || currentRoot, `第 ${i + 1} 题`);
+          const solved = await this.solveExerciseQuestion(AiWorkspace.getExerciseContainer() || currentRoot, `第 ${i + 1} 题`);
+          if (!solved) return false;
         }
         return true;
       }
@@ -2189,7 +2248,8 @@ ${ocrText}
         const fingerprint = AiWorkspace.normalizeText(questionRoot?.innerText || '').slice(0, 120);
         if (!fingerprint) break;
         if (i > 0 && fingerprint === previousFingerprint) break;
-        await this.solveExerciseQuestion(currentRoot, this.getExerciseQuestionLabel(currentRoot) || `第 ${i + 1} 题`);
+        const solved = await this.solveExerciseQuestion(currentRoot, this.getExerciseQuestionLabel(currentRoot) || `第 ${i + 1} 题`);
+        if (!solved) return false;
         previousFingerprint = fingerprint;
         const moved = await this.advanceExerciseQuestion(currentRoot, fingerprint);
         if (!moved) break;
@@ -2197,44 +2257,44 @@ ${ocrText}
       return true;
     }
 
-    // 直接在ai-workspace页面处理课程的逻辑
-    async handleNext(count) {
-      if (count >= this.source.length) {
-        this.panel.log('课程刷完啦 🎉');
-        this.panel.resetStartButton('刷完啦~');
+    // ai-workspace：迭代处理，避免跨数十个知识点递归积累定时器与调用栈。
+    async run() {
+      const visited = new Set();
+      const stop = message => {
+        if (message) this.panel.warn(message);
         Store.clearPendingAutoStart();
-        return;
+        this.panel.resetStartButton('开始刷课');
+      };
+      // 保留原版兼容处理；避免在循环中重复覆盖全局监听方法。
+      preventScreenCheck();
+      try {
+        while (true) {
+          const route = AiWorkspace.getRoute();
+          if (!route?.leafId) { stop('未能识别当前知识点'); return; }
+          const key = `${route.classroomId}/${route.type}/${route.leafId}/${route.nodeId || ''}`;
+          if (visited.has(key)) { stop('检测到重复知识点，停止以防循环'); return; }
+          visited.add(key);
+          let ok = false;
+          if (route.type === 'video' || route.type === 'audio') {
+            ok = await this.handleMedia(route);
+          } else if (route.type === 'exercise') {
+            ok = await this.handleExercise(route);
+          } else {
+            stop(`暂不支持任务类型 ${route.type}，不自动跳过`);
+            return;
+          }
+          if (!ok) { stop('当前任务未确认完成，停止自动切换'); return; }
+          const moved = await this.autoSelect(route);
+          if (moved === 'handoff') return; // 由原课程目录窗口继续处理。
+          if (!moved) {
+            stop('已停止课程导航；请确认当前任务进度及下一知识点');
+            return;
+          }
+        }
+      } catch (error) {
+        console.error('雨课堂运行错误：', error);
+        stop('运行异常，已停止自动切换：' + (error?.message || '未知错误'));
       }
-      this.source[count].firstChild.click();
-      await Utils.sleep(2000);
-      await this.run(false)
-    }
-
-    async run(preventScreenCheckSwitch = true) {
-      // 仅开启一次防切屏
-      if (preventScreenCheckSwitch) preventScreenCheck();
-      const route = AiWorkspace.getRoute();
-      if (!route) {
-        this.panel.log('当前页面已离开 ai-workspace/lms-graph');
-        return;
-      }
-      if (!route.leafId) {
-        this.panel.log('未能识别当前知识点');
-        return;
-      }
-      let ok = false;
-      if (route.type === 'video' || route.type === 'audio') {
-        ok = await this.handleMedia(route);
-      } else if (route.type === 'exercise') {
-        ok = await this.handleExercise(route);
-      } else {
-        this.panel.log(`当前类型为 ${route.type}，当前暂不自动处理此类型，自动跳过`);
-        await Utils.sleep(2000);
-        ok = true;
-      }
-      if (!ok) this.panel.warn("(该视频可能已经刷完了)，即将跳过开始下一个");
-      // 继续下一个
-      await this.autoSelect()
     }
   }
 
